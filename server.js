@@ -1,20 +1,14 @@
 const express = require('express');
 const cors = require('cors');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const OpenAI = require('openai');
 
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 
-// Gemini 2.0 Flash
+// Gemini 2.0 Flash - SEULE API utilisée
 const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
 const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
-
-// OpenAI pour TTS + Whisper
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
 
 // Prompts
 const PROMPT_SIMPLE = `Tu es un assistant pédagogique expert. Tu dois répondre de façon DIRECTE et UTILE.
@@ -47,9 +41,9 @@ RÈGLES :
 - Maximum 3 phrases
 - Français uniquement`;
 
-const PROMPT_COMPLEX = `Tu es un assistant pédagogique expert. Tu reçois des IMAGES d'un cours + l'AUDIO de ce que dit le professeur.
+const PROMPT_COMPLEX = `Tu es un assistant pédagogique expert. Tu reçois des IMAGES d'un cours + potentiellement une TRANSCRIPTION de ce que dit le professeur.
 
-PRIORITÉ : L'AUDIO. Le prof parle, écoute et réponds à ce qu'il demande.
+PRIORITÉ : LA TRANSCRIPTION si présente. Le prof parle, réponds à ce qu'il demande.
 
 ANALYSE ET RÉPONDS SELON LE CAS :
 
@@ -70,8 +64,8 @@ ANALYSE ET RÉPONDS SELON LE CAS :
 → Résume le point clé en une phrase
 → Si tu peux compléter/clarifier, fais-le
 
-❓ Audio pas clair ou question pas comprise :
-→ Dis "Question pas claire" ou base-toi sur l'image seule
+❓ Transcription pas claire ou absente :
+→ Base-toi sur l'image seule
 
 RÈGLES :
 - JAMAIS de formule de politesse
@@ -81,47 +75,25 @@ RÈGLES :
 
 // Health check
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', model: 'gemini-2.0-flash', modes: ['simple', 'complex'] });
+  res.json({ status: 'ok', model: 'gemini-2.0-flash', tts: 'browser', modes: ['simple', 'complex'] });
 });
 
-// Main analyze endpoint
+// Main analyze endpoint - retourne TEXTE seulement, TTS fait par le navigateur
 app.post('/analyze', async (req, res) => {
   const startTime = Date.now();
 
   try {
-    const { image, images, audio } = req.body;
+    const { image, images, transcription } = req.body;
 
     // Detect mode
-    const isComplex = (images && images.length > 1) || audio;
+    const isComplex = (images && images.length > 1) || transcription;
     const imageList = images || (image ? [image] : []);
 
     if (imageList.length === 0) {
       return res.status(400).json({ error: 'No image provided' });
     }
 
-    console.log(`[${new Date().toISOString()}] Mode: ${isComplex ? 'COMPLEX' : 'SIMPLE'}, Images: ${imageList.length}, Audio: ${audio ? 'yes' : 'no'}`);
-
-    let transcription = '';
-
-    // Whisper transcription if audio present
-    if (audio && isComplex) {
-      try {
-        console.log('Transcribing audio with Whisper...');
-        const audioBuffer = Buffer.from(audio, 'base64');
-        const audioFile = new File([audioBuffer], 'audio.wav', { type: 'audio/wav' });
-
-        const whisperResponse = await openai.audio.transcriptions.create({
-          file: audioFile,
-          model: 'whisper-1',
-          language: 'fr'
-        });
-
-        transcription = whisperResponse.text;
-        console.log(`Transcription: "${transcription.substring(0, 100)}..."`);
-      } catch (whisperError) {
-        console.error('Whisper error:', whisperError.message);
-      }
-    }
+    console.log(`[${new Date().toISOString()}] Mode: ${isComplex ? 'COMPLEX' : 'SIMPLE'}, Images: ${imageList.length}, Transcription: ${transcription ? 'yes' : 'no'}`);
 
     // Build Gemini request
     const parts = [];
@@ -150,25 +122,12 @@ app.post('/analyze', async (req, res) => {
     const responseText = result.response.text();
     console.log(`Gemini response: "${responseText.substring(0, 100)}..."`);
 
-    // Generate TTS
-    console.log('Generating TTS...');
-    const ttsResponse = await openai.audio.speech.create({
-      model: 'tts-1',
-      voice: 'nova',
-      input: responseText,
-      response_format: 'mp3',
-      speed: 1.15
-    });
-
-    const audioArrayBuffer = await ttsResponse.arrayBuffer();
-    const audioBase64 = Buffer.from(audioArrayBuffer).toString('base64');
-
     const totalTime = Date.now() - startTime;
     console.log(`Total time: ${totalTime}ms`);
 
+    // Retourne TEXTE seulement - le navigateur fait le TTS
     res.json({
       success: true,
-      audio: audioBase64,
       text: responseText,
       mode: isComplex ? 'complex' : 'simple',
       timing: totalTime
@@ -183,68 +142,12 @@ app.post('/analyze', async (req, res) => {
   }
 });
 
-// Raw MP3 endpoint
-app.post('/analyze/mp3', async (req, res) => {
-  try {
-    const { image, images, audio } = req.body;
-    const isComplex = (images && images.length > 1) || audio;
-    const imageList = images || (image ? [image] : []);
-
-    if (imageList.length === 0) {
-      return res.status(400).send('No image');
-    }
-
-    let transcription = '';
-    if (audio && isComplex) {
-      try {
-        const audioBuffer = Buffer.from(audio, 'base64');
-        const audioFile = new File([audioBuffer], 'audio.wav', { type: 'audio/wav' });
-        const whisperResponse = await openai.audio.transcriptions.create({
-          file: audioFile,
-          model: 'whisper-1',
-          language: 'fr'
-        });
-        transcription = whisperResponse.text;
-      } catch (e) {}
-    }
-
-    const parts = [];
-    for (const imgData of imageList) {
-      const base64Data = imgData.replace(/^data:image\/\w+;base64,/, '');
-      parts.push({ inlineData: { mimeType: 'image/jpeg', data: base64Data } });
-    }
-
-    let prompt = isComplex ? PROMPT_COMPLEX : PROMPT_SIMPLE;
-    if (transcription) prompt += `\n\nLe professeur dit : "${transcription}"`;
-    parts.push({ text: prompt });
-
-    const result = await model.generateContent(parts);
-    const responseText = result.response.text();
-
-    const ttsResponse = await openai.audio.speech.create({
-      model: 'tts-1',
-      voice: 'nova',
-      input: responseText,
-      response_format: 'mp3',
-      speed: 1.15
-    });
-
-    const audioArrayBuffer = await ttsResponse.arrayBuffer();
-    res.set('Content-Type', 'audio/mpeg');
-    res.send(Buffer.from(audioArrayBuffer));
-
-  } catch (error) {
-    console.error('Error:', error);
-    res.status(500).send('Error');
-  }
-});
-
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Vision Assistant Server running on port ${PORT}`);
-  console.log('Model: Gemini 2.0 Flash');
+  console.log('Model: Gemini 2.0 Flash (Google only - no OpenAI)');
+  console.log('TTS: Browser-based (Web Speech API)');
   console.log('Endpoints:');
   console.log('  GET  /health');
   console.log('  POST /analyze');
-  console.log('  POST /analyze/mp3');
 });
